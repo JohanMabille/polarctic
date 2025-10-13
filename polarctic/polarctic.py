@@ -2,10 +2,11 @@ import datetime as dt
 import ast
 import re
 import polars as pl
-from typing import Any, Optional
 from arcticdb import Arctic, LibraryOptions, QueryBuilder, LazyDataFrame, OutputFormat
 from arcticdb.version_store.library import Library
-from typing import Iterator
+from arcticdb.version_store.processing import ExpressionNode
+from arcticdb_ext.version_store import OperationType
+from typing import cast, Iterator, Any, Optional
 
 class PolarsToArcticDBTranslator:
     """
@@ -15,11 +16,8 @@ class PolarsToArcticDBTranslator:
         translator = PolarsToArcticDBTranslator()
         qb = translator.translate(polars_expr, query_builder)
     """
-    
-    def __init__(self):
-        self.qb = None
-        
-    def translate(self, polars_expr: str, query_builder: Any) -> Any:
+
+    def translate(self, polars_expr: pl.Expr, query_builder: Any) -> Any:
         """
         Translate a Polars expression string to ArcticDB QueryBuilder operations.
         
@@ -30,24 +28,37 @@ class PolarsToArcticDBTranslator:
         Returns:
             Modified QueryBuilder instance
         """
-        self.qb = query_builder
         
         # Clean the expression - remove surrounding brackets if present
-        expr = polars_expr.strip()
+        expr = str(polars_expr).strip()
         if expr.startswith('[') and expr.endswith(']'):
             expr = expr[1:-1].strip()
+
+        expr = self._replace_square_brackets(expr)
         
         # Preprocess to handle Polars-specific notation like [dyn int: 2]
         expr = self._preprocess_expression(expr)
-        
-        # Parse the expression
+
+         # Parse the expression
         try:
             tree = ast.parse(expr, mode='eval')
-            self._process_node(tree.body)
+            expr_node = self._process_node(tree.body)
         except SyntaxError as e:
             raise ValueError(f"Invalid Polars expression: {polars_expr}") from e
         
-        return self.qb
+        return query_builder[expr_node]
+        
+    def _replace_square_brackets(self, text: str) -> str:
+        while True:
+            close = text.rfind('])')
+            if close == -1:
+                break
+            open_ = text.rfind('([', 0, close)
+            if open_ == -1:
+                break
+            # Replace the matched ([...]) with (...)
+            text = text[:open_] + '(' + text[open_ + 2:close] + ')' + text[close + 2:]
+        return text
     
     def _preprocess_expression(self, expr: str) -> str:
         """
@@ -56,70 +67,78 @@ class PolarsToArcticDBTranslator:
         Converts patterns like [dyn int: 2] to just the value (2).
         """
         # Pattern to match [dyn type: value] or [lit type: value]
-        pattern = r'\[(dyn|lit)\s+\w+:\s*([^\]]+)\]'
+        pattern = r'[\[\(](dyn|lit)\s+\w+:\s*([^\]\)]+)[\]\)]'
         
-        def replace_dynamic(match):
+        def replace_dynamic(match: re.Match) -> Any:
             return match.group(2).strip()
         
         return re.sub(pattern, replace_dynamic, expr)
-    
+
     def _process_node(self, node: ast.AST) -> Any:
         """Process an AST node and apply corresponding ArcticDB operation."""
-        
-        if isinstance(node, ast.Call):
-            return self._process_call(node)
-        elif isinstance(node, ast.Attribute):
-            return self._process_attribute(node)
-        elif isinstance(node, ast.Name):
-            return node.id
-        elif isinstance(node, ast.Constant):
-            return node.value
-        elif isinstance(node, ast.Compare):
-            return self._process_compare(node)
-        elif isinstance(node, ast.BinOp):
-            return self._process_binop(node)
-        elif isinstance(node, ast.UnaryOp):
-            return self._process_unaryop(node)
-        elif isinstance(node, ast.List):
-            return [self._process_node(elt) for elt in node.elts]
-        elif isinstance(node, ast.Tuple):
-            return tuple(self._process_node(elt) for elt in node.elts)
-        else:
-            raise NotImplementedError(f"Node type {type(node).__name__} not supported")
-    
+
+        node_type = type(node)
+        match node_type:
+            case ast.Call:
+                return self._process_call(cast(ast.Call, node))
+            case ast.Attribute:
+                return self._process_attribute(cast(ast.Attribute, node))
+            case ast.Name:
+                return cast(ast.Name, node).id
+            case ast.Constant:
+                return cast(ast.Constant, node).value
+            case ast.Compare:
+                return self._process_compare(cast(ast.Compare, node))
+            case ast.BinOp:
+                return self._process_binop(cast(ast.BinOp, node))
+            case ast.UnaryOp:
+                return self._process_unaryop(cast(ast.UnaryOp, node))
+            #case ast.List:
+            #    return [self._process_node(elt) for elt in node.elts]
+            #case ast.Tuple:
+            #    return tuple(self._process_node(elt) for elt in node.elts)
+            case _:
+                raise NotImplementedError(f"Node type {node_type.__name__} not supported")
+
     def _process_call(self, node: ast.Call) -> Any:
         """Process function calls (e.g., pl.col(), methods)."""
-        
-        if isinstance(node.func, ast.Attribute):
-            # Method call like pl.col('x').sum()
-            obj = self._process_node(node.func.value)
-            method = node.func.attr
-            args = [self._process_node(arg) for arg in node.args]
-            kwargs = {kw.arg: self._process_node(kw.value) for kw in node.keywords}
+
+        func_type = type(node.func)
+        match func_type:
+            case ast.Attribute:
+                # TODO: rework this
+                # Method call like pl.col('x').sum()
+                #obj = self._process_node(node.func.value)
+                #method = node.func.attr
+                #args = [self._process_node(arg) for arg in node.args]
+                #kwargs = {kw.arg: self._process_node(kw.value) for kw in node.keywords}
+                
+                #return self._apply_method(obj, method, args, kwargs)
+                raise NotImplementedError(f"Node.func type ast.Attribute not supported")
             
-            return self._apply_method(obj, method, args, kwargs)
-        elif isinstance(node.func, ast.Name):
-            # Function call like col('x')
-            func_name = node.func.id
-            args = [self._process_node(arg) for arg in node.args]
-            
-            if func_name == 'col':
-                return args[0] if args else None
-            
-        return None
-    
+            case ast.Name:
+                # Function call like col('x')
+                func_name = cast(ast.Name, node.func).id
+                args = [self._process_node(arg) for arg in node.args]
+                
+                if func_name == 'col':
+                    return ExpressionNode.column_ref(args[0]) if args else None
+            case _:
+                return None
+
     def _process_attribute(self, node: ast.Attribute) -> Any:
         """Process attribute access like pl.col or obj.attr."""
-        
+        #TODO rework this
         obj = self._process_node(node.value)
         attr = node.attr
-        
+
         # Handle pl.col pattern
-        if obj == 'pl' and attr == 'col':
-            return 'col'
+        #if obj == 'pl' and attr == 'col':
+        #    return 'col'
         
-        return f"{obj}.{attr}"
-    
+        #return f"{obj}.{attr}"
+        raise NotImplementedError(f"{obj}.{attr}: Node type ast.Attribute not supported")
+
     def _process_compare(self, node: ast.Compare) -> Any:
         """Process comparison operations and apply filters."""
         
@@ -128,133 +147,75 @@ class PolarsToArcticDBTranslator:
         # Handle multiple comparisons
         for op, comparator in zip(node.ops, node.comparators):
             right = self._process_node(comparator)
-            
-            if isinstance(op, ast.Eq):
-                self.qb = self.qb.filter(left, '==', right)
-            elif isinstance(op, ast.NotEq):
-                self.qb = self.qb.filter(left, '!=', right)
-            elif isinstance(op, ast.Lt):
-                self.qb = self.qb.filter(left, '<', right)
-            elif isinstance(op, ast.LtE):
-                self.qb = self.qb.filter(left, '<=', right)
-            elif isinstance(op, ast.Gt):
-                self.qb = self.qb.filter(left, '>', right)
-            elif isinstance(op, ast.GtE):
-                self.qb = self.qb.filter(left, '>=', right)
-            elif isinstance(op, ast.In):
-                self.qb = self.qb.filter(left, 'isin', right)
-            elif isinstance(op, ast.NotIn):
-                self.qb = self.qb.filter(left, 'isnotin', right)
+            expr_node = None
+            op_type = type(op)
+
+            match op_type:
+                case ast.Eq:
+                    expr_node = ExpressionNode.compose(left, OperationType.EQ, right)
+                case ast.NotEq:
+                    expr_node = ExpressionNode.compose(left, OperationType.NE, right)
+                case ast.Lt:
+                    expr_node = ExpressionNode.compose(left, OperationType.LT, right)
+                case ast.LtE:
+                    expr_node = ExpressionNode.compose(left, OperationType.LE, right)
+                case ast.Gt:
+                    expr_node = ExpressionNode.compose(left, OperationType.GT, right)
+                case ast.GtE:
+                    expr_node = ExpressionNode.compose(left, OperationType.GE, right)
+                case ast.In:
+                    expr_node = ExpressionNode.compose(left, OperationType.ISIN, right)
+                case ast.NotIn:
+                    expr_node = ExpressionNode.compose(left, OperationType.ISNOTIN, right)
+                case _:
+                    raise NotImplementedError(f"Operator {op_type} not supported")
+            left = expr_node
         
-        return self.qb
-    
+        return expr_node
+
     def _process_binop(self, node: ast.BinOp) -> Any:
         """Process binary operations."""
         
         left = self._process_node(node.left)
+        
         right = self._process_node(node.right)
-        op = node.op
-        
-        # For column operations, apply them via apply method
-        if isinstance(op, ast.Add):
-            self.qb = self.qb.apply(f"{left}_plus_{right}", f"{left} + {right}")
-        elif isinstance(op, ast.Sub):
-            self.qb = self.qb.apply(f"{left}_minus_{right}", f"{left} - {right}")
-        elif isinstance(op, ast.Mult):
-            self.qb = self.qb.apply(f"{left}_times_{right}", f"{left} * {right}")
-        elif isinstance(op, ast.Div):
-            self.qb = self.qb.apply(f"{left}_div_{right}", f"{left} / {right}")
-        elif isinstance(op, ast.Mod):
-            self.qb = self.qb.apply(f"{left}_mod_{right}", f"{left} % {right}")
-        elif isinstance(op, ast.Pow):
-            self.qb = self.qb.apply(f"{left}_pow_{right}", f"{left} ** {right}")
-        
-        return self.qb
+        op_type = type(node.op)
+
+        match op_type:
+            case ast.Add:
+                return ExpressionNode.compose(left, OperationType.ADD, right)
+            case ast.Sub:
+                return ExpressionNode.compose(left, OperationType.SUB, right)
+            case ast.Mult:
+                return ExpressionNode.compose(left, OperationType.MUL, right)
+            case ast.Div:
+                return ExpressionNode.compose(left, OperationType.DIV, right)
+            # TODO: operator & and | can be used for boolean operations between
+            # filters, or bitwise operations between integers values. The current
+            # implementation supports boolean operations only (which should be
+            # the most common case)
+            case ast.BitOr:
+                return ExpressionNode.compose(left, OperationType.OR, right)
+            case ast.BitAnd:
+                return ExpressionNode.compose(left, OperationType.AND, right)
+            case _:
+                raise NotImplementedError(f"Operator {op_type} not supported")
     
     def _process_unaryop(self, node: ast.UnaryOp) -> Any:
         """Process unary operations."""
         
         operand = self._process_node(node.operand)
-        op = node.op
-        
-        if isinstance(op, ast.Not):
-            # Invert filter condition
-            pass
-        elif isinstance(op, ast.USub):
-            self.qb = self.qb.apply(f"neg_{operand}", f"-{operand}")
-        
-        return self.qb
-    
-    def _apply_method(self, obj: Any, method: str, args: list, kwargs: dict) -> Any:
-        """Apply Polars methods as ArcticDB operations."""
-        
-        col_name = obj if isinstance(obj, str) else None
-        
-        # Math methods
-        if method == 'pow':
-            exponent = args[0] if args else 2
-            self.qb = self.qb.apply(f"{col_name}_pow_{exponent}", f"{col_name} ** {exponent}")
-        elif method == 'sqrt':
-            self.qb = self.qb.apply(f"{col_name}_sqrt", f"{col_name} ** 0.5")
-        elif method == 'abs':
-            self.qb = self.qb.apply(f"{col_name}_abs", f"abs({col_name})")
-        elif method == 'round':
-            decimals = args[0] if args else 0
-            self.qb = self.qb.apply(f"{col_name}_round", f"round({col_name}, {decimals})")
-        
-        # Aggregation methods
-        elif method == 'sum':
-            self.qb = self.qb.groupby(args[0] if args else None).agg({col_name: 'sum'}) if args else self.qb.agg({col_name: 'sum'})
-        elif method == 'mean':
-            self.qb = self.qb.groupby(args[0] if args else None).agg({col_name: 'mean'}) if args else self.qb.agg({col_name: 'mean'})
-        elif method == 'min':
-            self.qb = self.qb.groupby(args[0] if args else None).agg({col_name: 'min'}) if args else self.qb.agg({col_name: 'min'})
-        elif method == 'max':
-            self.qb = self.qb.groupby(args[0] if args else None).agg({col_name: 'max'}) if args else self.qb.agg({col_name: 'max'})
-        elif method == 'count':
-            self.qb = self.qb.groupby(args[0] if args else None).agg({col_name: 'count'}) if args else self.qb.agg({col_name: 'count'})
-        elif method == 'std':
-            self.qb = self.qb.groupby(args[0] if args else None).agg({col_name: 'std'}) if args else self.qb.agg({col_name: 'std'})
-        elif method == 'var':
-            self.qb = self.qb.groupby(args[0] if args else None).agg({col_name: 'var'}) if args else self.qb.agg({col_name: 'var'})
-        
-        # String methods
-        elif method == 'str':
-            # String namespace - return for chaining
-            return col_name
-        elif method in ['upper', 'lower', 'strip', 'lstrip', 'rstrip']:
-            self.qb = self.qb.apply(f"{col_name}_{method}", f"{col_name}.str.{method}()")
-        elif method == 'contains':
-            pattern = args[0] if args else ''
-            self.qb = self.qb.filter(col_name, 'contains', pattern)
-        
-        # Date/time methods
-        elif method == 'dt':
-            # Datetime namespace - return for chaining
-            return col_name
-        elif method in ['year', 'month', 'day', 'hour', 'minute', 'second']:
-            self.qb = self.qb.apply(f"{col_name}_{method}", f"{col_name}.dt.{method}")
-        
-        # Casting
-        elif method == 'cast':
-            dtype = args[0] if args else None
-            self.qb = self.qb.apply(f"{col_name}_cast", f"{col_name}.astype('{dtype}')")
-        
-        # Null handling
-        elif method == 'is_null':
-            self.qb = self.qb.filter(col_name, 'isnull')
-        elif method == 'is_not_null':
-            self.qb = self.qb.filter(col_name, 'notnull')
-        elif method == 'fill_null':
-            value = args[0] if args else None
-            self.qb = self.qb.apply(f"{col_name}_filled", f"{col_name}.fillna({value})")
-        
-        # Alias
-        elif method == 'alias':
-            new_name = args[0] if args else col_name
-            self.qb = self.qb.apply(new_name, col_name)
-        
-        return self.qb
+        op_type = type(node.op)
+
+        match op_type:
+            case ast.Invert:
+                return ExpressionNode.compose(operand, OperationType.NOT, None)
+            case ast.USub:
+                return ExpressionNode.compose(operand, OperationType.NEG, None)
+            case _:
+                raise NotImplementedError(f"Operator {op_type} not supported")
+            
+        return None
 
 def parse_schema(
     lib: Library,
@@ -283,18 +244,14 @@ def scan_arcticdb(
         batch_size: int | None
     ) -> Iterator[pl.DataFrame]:
 
+        qb = None
         if predicate is not None:
-            print(str(predicate))
-        else:
-            print("No Predicate")
-
-        if with_columns:
-            print(with_columns)
-        else:
-            print("No column")
-    
+            tl = PolarsToArcticDBTranslator()
+            qb = QueryBuilder()
+            qb = tl.translate(predicate, qb)
+        
         # TODO: convert predicate to QueryBuilder and pass it to read
-        lazy_df = lib.read(symbol, as_of = as_of, columns = with_columns, lazy = True, output_format=OutputFormat.EXPERIMENTAL_ARROW)
+        lazy_df = lib.read(symbol, as_of = as_of, columns = with_columns, query_builder = qb, lazy = True, output_format=OutputFormat.EXPERIMENTAL_ARROW)
 
         if batch_size is None:
             batch_size = 1000
@@ -312,6 +269,6 @@ def scan_arcticdb(
             elif arrow_df.num_rows < batch_size:
                 n_rows = 0
 
-            yield pl.from_arrow(arrow_df)
+            yield cast(pl.DataFrame, pl.from_arrow(arrow_df))
 
     return pl.io.plugins.register_io_source(io_source=source_generator, schema = schema)    
